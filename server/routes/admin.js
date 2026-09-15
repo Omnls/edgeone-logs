@@ -19,6 +19,7 @@
  */
 
 import { verifySharedSecret } from "../lib/auth.js";
+import { verifySessionToken } from "../lib/session.js";
 import {
   BATCH_SCHEMA_VERSION,
   getBatch,
@@ -182,6 +183,7 @@ export function recordMatchesFilters(record, filters) {
 export async function handleAdminRequest({
   method = "GET",
   adminKeyHeader,
+  sessionCookie,
   env,
   store,
   date,
@@ -207,11 +209,19 @@ export async function handleAdminRequest({
   }
 
   // ─── 2. 鉴权（先于任何存储 I/O） ─────────────────────────────────
+  // 两条路径任一通过即放行：X-Admin-Key 请求头（原有、向后兼容）或有效的
+  // session cookie（登录后下发，见 server/lib/session.js）。都失败才 401。
   const expected = env[ENV_ADMIN_KEY];
   if (typeof expected !== "string" || expected.length === 0) {
     return { status: 503, body: { error: "admin_key_not_configured" } };
   }
-  if (!verifySharedSecret(adminKeyHeader, expected)) {
+  const headerOk = verifySharedSecret(adminKeyHeader, expected);
+  const cookieOk =
+    !headerOk &&
+    typeof sessionCookie === "string" &&
+    sessionCookie.length > 0 &&
+    verifySessionToken({ token: sessionCookie, secret: expected, now });
+  if (!headerOk && !cookieOk) {
     return { status: 401, body: { error: "unauthorized" } };
   }
 
@@ -433,6 +443,164 @@ export async function handleAdminRequest({
       batches,
       ...(listResult.cursor !== undefined ? { cursor: listResult.cursor } : {}),
       note: "counts describe this bounded page only, not the whole partition",
+    },
+  };
+}
+
+/**
+ * 一次性清空确认口令。要求调用方显式传入且必须逐字匹配，防止浏览器预取、
+ * 缓存或误点直接触发一个有副作用的清空操作。
+ */
+export const PURGE_CONFIRM_TOKEN = "yes-clear-all";
+
+/**
+ * 单次清空处理的键数上限（自设，非平台限制）。
+ *
+ * 超过时必须显式拒绝整批操作，不能只删前 N 个就停：那样会让调用方以为已经
+ * 清空，实际上留有残留对象，而且残留哪些键还不确定。
+ */
+export const MAX_PURGE_KEYS = 5000;
+
+/**
+ * DELETE /logs-purge 一次性清空全部日志的核心处理。与 HTTP 框架无关。
+ *
+ * ─── 与 handleAdminRequest 的关系 ──────────────────────────────────────
+ * 鉴权逻辑（第 2 步）与 handleAdminRequest 完全一致、直接复制：两者都要求
+ * X-Admin-Key 或有效 session cookie 任一通过即可，逻辑本身很短（约 10
+ * 行），项目里没有把它们抽成共享 helper 的先例，这里保持同样的处理方式，
+ * 避免为了复用几行代码引入新的抽象层。
+ *
+ * ─── 列举策略 ──────────────────────────────────────────────────────────
+ * handleAdminRequest/listBatches 强制 paginate:false，是因为单个 UTC 小时
+ * 分区可能很大，必须分页读避免超时。清空操作的语义不同：必须拿到 `logs/`
+ * 前缀下的**全部**键才能判断「清空是否完整」，因此这里改为 paginate:true，
+ * 让 SDK 内部循环聚合所有分页。这个假设的前提是当前数据量还小（自设
+ * MAX_PURGE_KEYS 上限即是这个假设的护栏）：一旦键数超过上限就直接拒绝执行，
+ * 不做静默截断，避免「看起来清空了、其实还有残留」。
+ *
+ * ─── 删除失败策略 ──────────────────────────────────────────────────────
+ * 选择「遇到第一个失败立即停止」，而不是「跳过失败的键继续删剩下的」。
+ * 理由：这是破坏性操作，删除失败最可能意味着存储层出现了异常（网络、权限、
+ * 一致性问题），继续对其余键发起删除只会让状态更难判断。停止后返回已成功
+ * 删除的 deletedCount 与失败的 key，调用方可以根据这两个数确认到底删了
+ * 多少、卡在哪个键，必要时重新调用本接口继续清空剩余对象（store.delete 对
+ * 已不存在的键是幂等的，见 @edgeone/pages-blob 的实现）。
+ *
+ * @param {object} params
+ * @returns {Promise<{ status: number, body: object, headers?: Record<string,string> }>}
+ */
+export async function handlePurgeRequest({
+  method = "DELETE",
+  adminKeyHeader,
+  sessionCookie,
+  env,
+  store,
+  confirm,
+  now,
+  maxPurgeKeys = MAX_PURGE_KEYS,
+}) {
+  // ─── 1. 方法 ──────────────────────────────────────────────────────
+  // 必须是 DELETE：清空有副作用，绝不能用 GET，否则浏览器预取/缓存/爬虫都
+  // 可能无意触发。
+  if (method !== "DELETE") {
+    return {
+      status: 405,
+      body: { error: "method_not_allowed" },
+      headers: { allow: "DELETE" },
+    };
+  }
+
+  // ─── 2. 鉴权（先于任何存储 I/O）。与 handleAdminRequest 完全一致 ────
+  const expected = env[ENV_ADMIN_KEY];
+  if (typeof expected !== "string" || expected.length === 0) {
+    return { status: 503, body: { error: "admin_key_not_configured" } };
+  }
+  const headerOk = verifySharedSecret(adminKeyHeader, expected);
+  const cookieOk =
+    !headerOk &&
+    typeof sessionCookie === "string" &&
+    sessionCookie.length > 0 &&
+    verifySessionToken({ token: sessionCookie, secret: expected, now });
+  if (!headerOk && !cookieOk) {
+    return { status: 401, body: { error: "unauthorized" } };
+  }
+
+  // ─── 3. 显式确认口令 ────────────────────────────────────────────────
+  // 缺失、显式空串、大小写不符或任何其他不完全匹配都视为非法，绝不放行。
+  if (
+    typeof confirm !== "string" ||
+    confirm.length === 0 ||
+    confirm !== PURGE_CONFIRM_TOKEN
+  ) {
+    return {
+      status: 400,
+      body: { error: "confirm_required", expected: PURGE_CONFIRM_TOKEN },
+    };
+  }
+
+  // ─── 4. 列举 logs/ 前缀下的全部键（见函数顶部注释的列举策略说明） ──
+  let listResult;
+  try {
+    listResult = await store.list({
+      prefix: "logs/",
+      directories: false,
+      paginate: true,
+      consistency: "strong",
+    });
+  } catch {
+    // 列举失败必须显式报错：绝不能把「列举失败」误当成「本来就没有对象」。
+    return { status: 500, body: { error: "storage_list_failed" } };
+  }
+
+  if (!listResult || !Array.isArray(listResult.blobs)) {
+    return { status: 500, body: { error: "storage_list_invalid" } };
+  }
+
+  const keys = [];
+  for (const blob of listResult.blobs) {
+    if (!blob || typeof blob.key !== "string" || blob.key.length === 0) {
+      return { status: 500, body: { error: "storage_list_invalid" } };
+    }
+    keys.push(blob.key);
+  }
+
+  // 先校验数量上限，再开始删除：不能先删一部分才发现超限。
+  if (keys.length > maxPurgeKeys) {
+    return {
+      status: 413,
+      body: {
+        error: "purge_key_count_exceeded",
+        maxKeys: maxPurgeKeys,
+        foundKeys: keys.length,
+        hint: "too many objects for a single automated purge; review manually",
+      },
+    };
+  }
+
+  // ─── 5. 逐个删除：遇到第一个失败立即停止（见函数顶部注释） ─────────
+  const deletedKeys = [];
+  for (const key of keys) {
+    try {
+      await store.delete(key);
+    } catch {
+      return {
+        status: 500,
+        body: {
+          error: "storage_delete_failed",
+          key,
+          deletedCount: deletedKeys.length,
+          deletedKeys,
+        },
+      };
+    }
+    deletedKeys.push(key);
+  }
+
+  return {
+    status: 200,
+    body: {
+      deletedCount: deletedKeys.length,
+      deletedKeys,
     },
   };
 }

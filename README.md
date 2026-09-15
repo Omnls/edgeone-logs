@@ -18,22 +18,47 @@ npm run check      # 语法检查 + 单元测试
 `npm run check` 等价于 `node scripts/check-syntax.mjs` 加 `node --test "tests/**/*.test.js"`。
 全部测试都在离线存储替身上运行，不连真实 Blob。
 
+## Pages 控制台构建设置
+
+在 EdgeOne Pages 创建项目并绑定本仓库时，构建设置按以下填写：
+
+| 字段 | 填写值 | 说明 |
+| --- | --- | --- |
+| 框架预设 | `Other` | 本项目没有前端框架，函数由平台按 `edgeone.json` 直接打包。 |
+| 根目录 | `./` | 保持默认。 |
+| 输出目录 | `public` | 唯一的静态输出目录，只有一个占位页 `public/index.html`。 |
+| 构建命令 | 留空 | 没有构建步骤；若控制台要求非空，可填 `echo skip`。 |
+| 安装命令 | `npm install` | 安装唯一依赖 `@edgeone/pages-blob`，Cloud Functions 运行时需要。 |
+
+环境变量按下方「环境变量」一节填写，至少要配置 `INGEST_SHARED_KEY` 与
+`ADMIN_SHARED_KEY`，两者都建议用高强度随机字符串，例如：
+
+```bash
+openssl rand -hex 32
+```
+
 ## 目录结构
 
 ```
 cloud-functions/
-  edgeone-logs.js          POST /edgeone-logs      日志接收入口
-  logs-admin/index.js      GET  /logs-admin        管理查询入口
+  edgeone-logs.js               POST /edgeone-logs        日志接收入口
+  logs-admin/index.js           GET  /logs-admin          管理查询入口
+  logs-admin-login/index.js     POST /logs-admin-login    管理端登录，签发会话 Cookie
+  logs-admin-logout/index.js    POST /logs-admin-logout   管理端登出，清除会话 Cookie
 server/
-  lib/auth.js              EdgeOne 签名算法 + 固定时间密钥比较
-  lib/parse-log-body.js    gzip 解压与 JSON Lines / 单对象 / 数组解析
-  lib/redact.js            默认脱敏规则
-  lib/http.js              统一响应头（no-store、nosniff）
-  routes/ingest.js         接收端业务逻辑
-  routes/admin.js          查询端业务逻辑
-  storage/batch-store.js   批次键计算与幂等写入
-  storage/get-store.js     生产环境唯一的 getStore 入口
+  lib/auth.js               EdgeOne 签名算法 + 固定时间密钥比较
+  lib/session.js            会话 token 签发与校验（无服务器侧状态）
+  lib/login-rate-limit.js   登录失败尽力而为限流
+  lib/parse-log-body.js     gzip 解压与 JSON Lines / 单对象 / 数组解析
+  lib/redact.js             默认脱敏规则
+  lib/http.js               统一响应头（no-store、nosniff）
+  routes/ingest.js          接收端业务逻辑
+  routes/admin.js           查询端业务逻辑
+  routes/admin-login.js     登录端业务逻辑
+  storage/batch-store.js    批次键计算与幂等写入
+  storage/get-store.js      生产环境唯一的 getStore 入口
 public/index.html          输出目录占位页
+public/admin.html           零依赖管理查询页面（登录 + 查询 + 登出）
 ```
 
 函数目录固定为 `cloud-functions/`，默认导出 `onRequest(context)`，文件名决定路由路径
@@ -64,7 +89,9 @@ public/index.html          输出目录占位页
 2. 日志输出格式保持默认的 **JSON Lines**。本项目也接受单个 JSON 对象与 JSON 数组，
    但不支持 CSV 与自定义模板格式，收到时会明确返回 400。
 3. 目的地选 **HTTP 服务（POST）**，接口地址填 `https://<你的域名>/edgeone-logs`。
-4. 内容压缩可以勾选 gzip，接收端按 `Content-Encoding: gzip` 解压。
+4. 内容压缩若控制台支持可勾选 gzip，接收端按 `Content-Encoding: gzip` 解压；
+   若该推送任务的控制台界面没有提供 gzip 选项（部分账号/版本不支持），
+   直接留空即可，接收端同样接受未压缩的 JSON Lines 正文。
 5. 自定义 HTTP 请求头添加 `X-Ingest-Key: <INGEST_SHARED_KEY 的值>`。
 6. 源站鉴权如需更强校验，选加密签名并填入与环境变量一致的 SecretId / SecretKey。
 
@@ -72,6 +99,15 @@ public/index.html          输出目录占位页
 这条请求同样需要带 `X-Ingest-Key`，否则会被 401 拒绝。
 
 ## 查询日志
+
+### 方式一：Web 管理页面
+
+访问 `https://<你的域名>/admin.html`，输入 `ADMIN_SHARED_KEY` 登录。登录成功后
+浏览器会收到一个 `HttpOnly; Secure; SameSite=Strict` 的会话 Cookie（有效期 12
+小时），页面本身不读取、不缓存该 Cookie 或密钥。之后可在页面上按日期/小时/
+状态码/host/requestId 过滤查询、翻页，点击「退出登录」清除会话。
+
+### 方式二：命令行 + 请求头
 
 ```bash
 curl -H "X-Admin-Key: $ADMIN_SHARED_KEY" \
@@ -86,6 +122,27 @@ curl -H "X-Admin-Key: $ADMIN_SHARED_KEY" \
 
 返回中的 `scannedBatches`、`matchedRecords` 只描述当前这一页，不是分区全量统计。
 响应字节超过 5 MiB 预算时返回 413 要求缩小范围，不会静默截断。
+
+`/logs-admin` 同时接受 `X-Admin-Key` 请求头与登录后签发的会话 Cookie，任一通过
+即可，两种方式可以并存使用。
+
+### 登录 / 登出接口
+
+```bash
+# 登录：成功返回 200 并在响应头带 Set-Cookie
+curl -i -X POST -H "content-type: application/json" \
+  -d '{"adminKey":"'"$ADMIN_SHARED_KEY"'"}' \
+  "https://<你的域名>/logs-admin-login"
+
+# 登出：清除会话 Cookie，不需要携带任何凭据
+curl -i -X POST "https://<你的域名>/logs-admin-logout"
+```
+
+会话 token 是无状态的：仅由 `ADMIN_SHARED_KEY` 签名的 `{ exp }` 时间戳构成，
+服务端不持久化任何会话记录，登出只是让浏览器丢弃本地 Cookie。登录失败按 UTC
+小时分桶计数，同一小时内失败次数达到上限（10 次）后直接返回 429，不再进行
+密钥比较；该限流是尽力而为的附加保护，非强一致，也不会因为限流子系统本身
+故障而拖累正常登录（见 `server/lib/login-rate-limit.js` 顶部注释）。
 
 ## 522 排查思路
 

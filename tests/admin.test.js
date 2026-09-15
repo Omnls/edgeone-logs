@@ -26,6 +26,7 @@ import {
   parseBoundedInt,
   recordMatchesFilters,
 } from "../server/routes/admin.js";
+import { createSessionToken } from "../server/lib/session.js";
 
 const ADMIN_KEY = "admin-key-at-least-24-chars-long";
 const INGEST_KEY = "ingest-key-at-least-24-chars-long";
@@ -170,6 +171,69 @@ test("鉴权先于任何存储 I/O：401 时不触碰 store", async () => {
   assert.equal(res.status, 401);
   assert.equal(store.listCalls.length, 0);
   assert.equal(store.getCalls.length, 0);
+});
+
+// ─── session cookie 鉴权（登录后免带 X-Admin-Key） ──────────────────
+
+test("有效 session cookie 可以替代 X-Admin-Key 通过鉴权", async () => {
+  const token = createSessionToken({ secret: ADMIN_KEY, now: FIXED_NOW });
+  const res = await handleAdminRequest({
+    sessionCookie: token,
+    env: ENV,
+    store: storeWith([]),
+    now: FIXED_NOW,
+  });
+  assert.equal(res.status, 200);
+});
+
+test("过期的 session cookie 被拒绝，返回 401", async () => {
+  const issuedAt = new Date(FIXED_NOW.getTime() - 13 * 60 * 60 * 1000); // 13 小时前签发
+  const token = createSessionToken({ secret: ADMIN_KEY, now: issuedAt });
+  const res = await handleAdminRequest({
+    sessionCookie: token,
+    env: ENV,
+    store: storeWith([]),
+    now: FIXED_NOW,
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});
+
+test("被篡改的 session cookie 被拒绝，返回 401", async () => {
+  const token = createSessionToken({ secret: ADMIN_KEY, now: FIXED_NOW });
+  const [payloadB64, hmacB64] = token.split(".");
+  const tamperedHmac = hmacB64.slice(0, -1) + (hmacB64.at(-1) === "A" ? "B" : "A");
+  const tampered = `${payloadB64}.${tamperedHmac}`;
+  const res = await handleAdminRequest({
+    sessionCookie: tampered,
+    env: ENV,
+    store: storeWith([]),
+    now: FIXED_NOW,
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});
+
+test("X-Admin-Key 与 session cookie 都缺失或都无效时才 401", async () => {
+  const res = await handleAdminRequest({
+    adminKeyHeader: "wrong",
+    sessionCookie: "not-a-valid-token",
+    env: ENV,
+    store: storeWith([]),
+    now: FIXED_NOW,
+  });
+  assert.equal(res.status, 401);
+});
+
+test("X-Admin-Key 正确时即使 cookie 无效也放行（两条路径任一通过即可）", async () => {
+  const res = await handleAdminRequest({
+    adminKeyHeader: ADMIN_KEY,
+    sessionCookie: "garbage",
+    env: ENV,
+    store: storeWith([]),
+    now: FIXED_NOW,
+  });
+  assert.equal(res.status, 200);
 });
 
 // ─── 参数校验 ────────────────────────────────────────────────────────

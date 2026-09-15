@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>EdgeOne 实时日志 - 管理查询</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0;
+    padding: 16px;
+    background: #f5f6f8;
+    color: #1a1a1a;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .card {
+    background: #fff;
+    border: 1px solid #dcdfe6;
+    border-radius: 6px;
+    padding: 16px;
+    margin-bottom: 16px;
+    max-width: 960px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: #555; }
+  .field input { padding: 6px 8px; border: 1px solid #c7c9cc; border-radius: 4px; font-size: 13px; }
+  button {
+    padding: 7px 14px;
+    border: 1px solid #3a6df0;
+    background: #3a6df0;
+    color: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  button.secondary { background: #fff; color: #444; border-color: #c7c9cc; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .msg { font-size: 13px; margin-top: 8px; }
+  .msg.error { color: #c0392b; }
+  .msg.ok { color: #1e8e3e; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px; }
+  th, td { border: 1px solid #e2e4e8; padding: 6px 8px; text-align: left; vertical-align: top; word-break: break-all; }
+  th { background: #f0f2f5; position: sticky; top: 0; }
+  .status-5xx { color: #c0392b; font-weight: bold; }
+  .status-4xx { color: #b8860b; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .hidden { display: none; }
+  .meta { font-size: 12px; color: #666; margin-top: 8px; }
+  #logoutBtn { margin-left: auto; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <h1>EdgeOne 实时日志 - 管理查询</h1>
+  <button id="logoutBtn" class="secondary hidden" type="button">退出登录</button>
+</div>
+
+<section id="loginCard" class="card">
+  <form id="loginForm">
+    <div class="row">
+      <div class="field">
+        <label for="adminKey">管理密钥</label>
+        <input id="adminKey" name="adminKey" type="password" autocomplete="current-password" required>
+      </div>
+    </div>
+    <button type="submit">登录</button>
+    <div id="loginMsg" class="msg" role="status" aria-live="polite"></div>
+  </form>
+</section>
+
+<section id="queryCard" class="card hidden">
+  <form id="queryForm">
+    <div class="row">
+      <div class="field">
+        <label for="date">日期（UTC，YYYY-MM-DD）</label>
+        <input id="date" name="date" type="text" placeholder="2026-09-13">
+      </div>
+      <div class="field">
+        <label for="hour">小时（UTC，00-23）</label>
+        <input id="hour" name="hour" type="text" placeholder="02">
+      </div>
+      <div class="field">
+        <label for="status">状态码（精确）</label>
+        <input id="status" name="status" type="text" placeholder="522">
+      </div>
+      <div class="field">
+        <label for="statusMin">状态码下限</label>
+        <input id="statusMin" name="statusMin" type="text" placeholder="500">
+      </div>
+      <div class="field">
+        <label for="statusMax">状态码上限</label>
+        <input id="statusMax" name="statusMax" type="text" placeholder="599">
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="host">RequestHost</label>
+        <input id="host" name="host" type="text" placeholder="example.com">
+      </div>
+      <div class="field">
+        <label for="requestId">RequestID</label>
+        <input id="requestId" name="requestId" type="text">
+      </div>
+      <div class="field">
+        <label for="limit">每页批次数（1-10）</label>
+        <input id="limit" name="limit" type="text" placeholder="5">
+      </div>
+    </div>
+    <button type="submit">查询</button>
+    <button type="button" id="resetCursorBtn" class="secondary">重新查询（清除分页）</button>
+    <div id="queryMsg" class="msg" role="status" aria-live="polite"></div>
+  </form>
+
+  <div id="resultMeta" class="meta hidden"></div>
+
+  <table id="resultTable" class="hidden">
+    <thead>
+      <tr>
+        <th>RequestTime</th>
+        <th>RequestHost</th>
+        <th>RequestUrl</th>
+        <th>EdgeResponseStatusCode</th>
+        <th>OriginResponseStatusCode</th>
+        <th>EdgeException</th>
+        <th>ClientIP</th>
+      </tr>
+    </thead>
+    <tbody id="resultBody"></tbody>
+  </table>
+
+  <button type="button" id="nextPageBtn" class="secondary hidden">下一页</button>
+</section>
+
+<script>
+(function () {
+  "use strict";
+
+  // 本页面不持有、不缓存任何密钥或 token：登录成功后由浏览器以
+  // HttpOnly Cookie 保存会话，脚本本身读不到、也不需要读到该 cookie。
+  // 所有请求都用相对路径，不硬编码域名。
+
+  var loginCard = document.getElementById("loginCard");
+  var queryCard = document.getElementById("queryCard");
+  var loginForm = document.getElementById("loginForm");
+  var loginMsg = document.getElementById("loginMsg");
+  var queryForm = document.getElementById("queryForm");
+  var queryMsg = document.getElementById("queryMsg");
+  var logoutBtn = document.getElementById("logoutBtn");
+  var resultTable = document.getElementById("resultTable");
+  var resultBody = document.getElementById("resultBody");
+  var resultMeta = document.getElementById("resultMeta");
+  var nextPageBtn = document.getElementById("nextPageBtn");
+  var resetCursorBtn = document.getElementById("resetCursorBtn");
+
+  var currentCursor = undefined;
+
+  function setMsg(el, text, kind) {
+    el.textContent = text;
+    el.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  function showQueryUi() {
+    loginCard.classList.add("hidden");
+    queryCard.classList.remove("hidden");
+    logoutBtn.classList.remove("hidden");
+  }
+
+  function showLoginUi() {
+    queryCard.classList.add("hidden");
+    loginCard.classList.remove("hidden");
+    logoutBtn.classList.add("hidden");
+    resultTable.classList.add("hidden");
+    resultMeta.classList.add("hidden");
+    nextPageBtn.classList.add("hidden");
+    resultBody.textContent = "";
+    currentCursor = undefined;
+  }
+
+  loginForm.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var adminKey = document.getElementById("adminKey").value;
+    if (!adminKey) return;
+
+    setMsg(loginMsg, "登录中...", "");
+    var submitBtn = loginForm.querySelector("button[type=submit]");
+    submitBtn.disabled = true;
+
+    fetch("/logs-admin-login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ adminKey: adminKey }),
+    })
+      .then(function (res) {
+        if (res.status === 200) {
+          document.getElementById("adminKey").value = "";
+          setMsg(loginMsg, "", "");
+          showQueryUi();
+          return;
+        }
+        if (res.status === 401) {
+          setMsg(loginMsg, "密钥错误", "error");
+          return;
+        }
+        if (res.status === 429) {
+          setMsg(loginMsg, "尝试次数过多，请稍后重试", "error");
+          return;
+        }
+        if (res.status === 503) {
+          setMsg(loginMsg, "服务端未配置管理密钥，请联系管理员", "error");
+          return;
+        }
+        setMsg(loginMsg, "登录失败（状态码 " + res.status + "）", "error");
+      })
+      .catch(function () {
+        setMsg(loginMsg, "网络错误，请重试", "error");
+      })
+      .finally(function () {
+        submitBtn.disabled = false;
+      });
+  });
+
+  logoutBtn.addEventListener("click", function () {
+    logoutBtn.disabled = true;
+    fetch("/logs-admin-logout", { method: "POST" })
+      .catch(function () {
+        // 忽略网络错误：无论请求是否成功，本地都应回到登录界面，
+        // 服务端 cookie 本身没有可信的服务端状态需要额外确认。
+      })
+      .finally(function () {
+        logoutBtn.disabled = false;
+        showLoginUi();
+      });
+  });
+
+  function buildQueryUrl(cursor) {
+    var params = new URLSearchParams();
+    var fields = ["date", "hour", "status", "statusMin", "statusMax", "host", "requestId", "limit"];
+    for (var i = 0; i < fields.length; i++) {
+      var name = fields[i];
+      var el = document.getElementById(name);
+      var value = el ? el.value.trim() : "";
+      if (value.length > 0) params.set(name, value);
+    }
+    if (cursor) params.set("cursor", cursor);
+    var qs = params.toString();
+    return "/logs-admin" + (qs.length > 0 ? "?" + qs : "");
+  }
+
+  // 逐个 textContent 赋值，不使用 innerHTML/insertAdjacentHTML，从根本上
+  // 避免日志字段（例如 RequestUrl、EdgeException 中可能出现的任意文本）
+  // 被当作 HTML 解析执行，杜绝反射型 XSS。
+  function renderRecords(records) {
+    resultBody.textContent = "";
+    var columns = [
+      "RequestTime",
+      "RequestHost",
+      "RequestUrl",
+      "EdgeResponseStatusCode",
+      "OriginResponseStatusCode",
+      "EdgeException",
+      "ClientIP",
+    ];
+    for (var i = 0; i < records.length; i++) {
+      var record = records[i];
+      var tr = document.createElement("tr");
+      for (var c = 0; c < columns.length; c++) {
+        var td = document.createElement("td");
+        var raw = record[columns[c]];
+        var text = raw === undefined || raw === null ? "-" : String(raw);
+        td.textContent = text;
+        if (columns[c].indexOf("StatusCode") !== -1) {
+          var n = Number(raw);
+          if (Number.isFinite(n) && n >= 500) td.className = "status-5xx";
+          else if (Number.isFinite(n) && n >= 400) td.className = "status-4xx";
+        }
+        tr.appendChild(td);
+      }
+      resultBody.appendChild(tr);
+    }
+  }
+
+  function runQuery(cursor) {
+    setMsg(queryMsg, "查询中...", "");
+    nextPageBtn.classList.add("hidden");
+
+    return fetch(buildQueryUrl(cursor), { method: "GET" })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          return { status: res.status, body: body };
+        });
+      })
+      .then(function (result) {
+        if (result.status === 401) {
+          setMsg(queryMsg, "登录已失效，请重新登录", "error");
+          showLoginUi();
+          return;
+        }
+        if (result.status !== 200) {
+          var errorCode = result.body && result.body.error ? result.body.error : ("HTTP " + result.status);
+          setMsg(queryMsg, "查询失败：" + errorCode, "error");
+          resultTable.classList.add("hidden");
+          resultMeta.classList.add("hidden");
+          return;
+        }
+
+        var body = result.body;
+        var records = [];
+        var batches = Array.isArray(body.batches) ? body.batches : [];
+        for (var i = 0; i < batches.length; i++) {
+          var batchRecords = Array.isArray(batches[i].records) ? batches[i].records : [];
+          for (var j = 0; j < batchRecords.length; j++) records.push(batchRecords[j]);
+        }
+
+        renderRecords(records);
+        resultTable.classList.remove("hidden");
+
+        resultMeta.textContent =
+          "时间窗口 " + body.datePart + " " + body.hourPart + " 时（UTC）· " +
+          "本页匹配 " + body.matchedRecords + " 条 · " +
+          "扫描批次 " + body.scannedBatches + " · " +
+          "扫描记录 " + body.scannedRecords;
+        resultMeta.classList.remove("hidden");
+
+        setMsg(queryMsg, "", "");
+
+        if (typeof body.cursor === "string" && body.cursor.length > 0) {
+          currentCursor = body.cursor;
+          nextPageBtn.classList.remove("hidden");
+        } else {
+          currentCursor = undefined;
+        }
+      })
+      .catch(function () {
+        setMsg(queryMsg, "网络错误，请重试", "error");
+      });
+  }
+
+  queryForm.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    currentCursor = undefined;
+    runQuery(undefined);
+  });
+
+  resetCursorBtn.addEventListener("click", function () {
+    currentCursor = undefined;
+    nextPageBtn.classList.add("hidden");
+  });
+
+  nextPageBtn.addEventListener("click", function () {
+    if (currentCursor) runQuery(currentCursor);
+  });
+})();
+</script>
+
+</body>
+</html>

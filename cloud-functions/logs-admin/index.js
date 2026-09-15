@@ -15,7 +15,34 @@ import {
   ADMIN_KEY_HEADER,
   handleAdminRequest,
 } from "../../server/routes/admin.js";
+import { SESSION_COOKIE_NAME } from "../../server/lib/session.js";
 import { getLogStore } from "../../server/storage/get-store.js";
+
+/**
+ * 从原始 Cookie 请求头中取出指定名字的取值。
+ *
+ * 只做最小、宽松的分段解析（按 `;` 切分、按首个 `=` 切分名值），不依赖任何
+ * cookie 解析库；找不到或格式异常时返回 undefined，由上层按「无 cookie」处理，
+ * 不抛错。
+ *
+ * @param {string|null} rawCookieHeader
+ * @param {string} name
+ * @returns {string|undefined}
+ */
+function readCookie(rawCookieHeader, name) {
+  if (typeof rawCookieHeader !== "string" || rawCookieHeader.length === 0) {
+    return undefined;
+  }
+  for (const part of rawCookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    if (key !== name) continue;
+    const value = part.slice(eq + 1).trim();
+    return value.length > 0 ? value : undefined;
+  }
+  return undefined;
+}
 
 /**
  * @param {{ request: Request, env: Record<string,string|undefined> }} context
@@ -44,6 +71,7 @@ export async function onRequest(context) {
     result = await handleAdminRequest({
       method: request.method,
       adminKeyHeader: request.headers.get(ADMIN_KEY_HEADER) ?? undefined,
+      sessionCookie: readCookie(request.headers.get("cookie"), SESSION_COOKIE_NAME),
       env,
       store,
       date: raw("date"),

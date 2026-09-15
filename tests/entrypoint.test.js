@@ -23,6 +23,8 @@ import { Store } from "@edgeone/pages-blob";
 
 import ingestEntry from "../cloud-functions/edgeone-logs.js";
 import adminEntry from "../cloud-functions/logs-admin/index.js";
+import loginEntry from "../cloud-functions/logs-admin-login/index.js";
+import logoutEntry from "../cloud-functions/logs-admin-logout/index.js";
 
 /** 官方连通性校验样例原文（docs/reference/61296.md:39-64），保留缩进与换行。 */
 const OFFICIAL_VERIFICATION_BODY = `{
@@ -385,4 +387,108 @@ test("管理入口拒绝非 GET", async () => {
   });
   assert.equal(response.status, 405);
   assert.equal(response.headers.get("allow"), "GET");
+});
+
+function loginRequest(bodyObj, headers = {}) {
+  return new Request("https://logs.example.com/logs-admin-login", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(bodyObj),
+  });
+}
+
+test("登录入口：正确密钥返回 200 且下发带全部安全属性的 Set-Cookie", async () => {
+  const response = await loginEntry({
+    request: loginRequest({ adminKey: ADMIN_KEY }),
+    env: adminEnv(),
+  });
+  assert.equal(response.status, 200);
+  assertSecurityHeaders(response);
+  const body = await response.json();
+  assert.equal(body.ok, true);
+
+  const setCookie = response.headers.get("set-cookie");
+  assert.ok(setCookie, "success response must set a cookie");
+  assert.match(setCookie, /^eo_admin_session=/);
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=Strict/);
+  assert.match(setCookie, /Path=\//);
+  assert.match(setCookie, /Max-Age=43200/);
+
+  // 下发的 token 可以直接被管理查询接口通过 cookie 接受。
+  const cookieValue = setCookie.split(";")[0];
+  const adminResponse = await adminEntry({
+    request: new Request("https://logs.example.com/logs-admin", {
+      method: "GET",
+      headers: { cookie: cookieValue },
+    }),
+    env: adminEnv(),
+  });
+  assert.equal(adminResponse.status, 200);
+});
+
+test("登录入口：错误密钥返回 401 且不带 Set-Cookie", async () => {
+  const response = await loginEntry({
+    request: loginRequest({ adminKey: "wrong-key" }),
+    env: adminEnv(),
+  });
+  assert.equal(response.status, 401);
+  assert.equal(response.headers.get("set-cookie"), null);
+});
+
+test("登录入口：非 POST 返回 405 且带 Allow", async () => {
+  const response = await loginEntry({
+    request: new Request("https://logs.example.com/logs-admin-login", {
+      method: "GET",
+    }),
+    env: adminEnv(),
+  });
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get("allow"), "POST");
+});
+
+test("登录入口：畸形 JSON 正文返回 400 而不是抛出异常", async () => {
+  const response = await loginEntry({
+    request: new Request("https://logs.example.com/logs-admin-login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{ 这不是合法 JSON",
+    }),
+    env: adminEnv(),
+  });
+  assert.equal(response.status, 400);
+  assertSecurityHeaders(response);
+});
+
+test("登录入口：未配置 ADMIN_SHARED_KEY 返回 503", async () => {
+  const response = await loginEntry({
+    request: loginRequest({ adminKey: ADMIN_KEY }),
+    env: { BLOB_STORE: "logs-test-store" },
+  });
+  assert.equal(response.status, 503);
+});
+
+test("退出登录入口：POST 返回 200 且用已过期 Set-Cookie 清除会话", async () => {
+  const response = await logoutEntry({
+    request: new Request("https://logs.example.com/logs-admin-logout", {
+      method: "POST",
+    }),
+    env: adminEnv(),
+  });
+  assert.equal(response.status, 200);
+  const setCookie = response.headers.get("set-cookie");
+  assert.match(setCookie, /^eo_admin_session=;/);
+  assert.match(setCookie, /Max-Age=0/);
+});
+
+test("退出登录入口：非 POST 返回 405", async () => {
+  const response = await logoutEntry({
+    request: new Request("https://logs.example.com/logs-admin-logout", {
+      method: "GET",
+    }),
+    env: adminEnv(),
+  });
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get("allow"), "POST");
 });
