@@ -1,0 +1,18 @@
+{
+  "name": "edgeone-realtime-logs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "EdgeOne 实时日志接收器，将七层访问日志批次落盘到 Pages Blob，用于诊断 522 等 HTTP 错误",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\"",
+    "check": "npm run lint:syntax && npm test",
+    "lint:syntax": "node scripts/check-syntax.mjs"
+  },
+  "dependencies": {
+    "@edgeone/pages-blob": "0.0.16"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

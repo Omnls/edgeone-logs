@@ -1,0 +1,11 @@
+node_modules/
+.edgeone/
+.env
+.env.local
+.env.*.local
+!.env.example
+*.log
+
+# 内部协作过程文件与第三方文档镜像，不属于项目交付物
+.teamwork/
+docs/reference/

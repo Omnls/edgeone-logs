@@ -1,0 +1,21 @@
+{
+  "name": "edgeone-realtime-logs",
+  "nodeVersion": "20.18.0",
+  "outputDirectory": "public",
+  "cloudFunctions": {
+    "nodejs": {
+      "maxDuration": 120,
+      "includeFiles": ["server/**", "node_modules/@edgeone/pages-blob/**"]
+    }
+  },
+  "headers": [
+    {
+      "source": "/*",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ]
+}
